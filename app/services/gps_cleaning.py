@@ -1,102 +1,123 @@
 import pandas as pd
 from pathlib import Path
+import re
 
-NAME_SUFFIXES = {'jr', 'sr', 'ii', 'iii', 'iv'}
+def _safe_col(df: pd.DataFrame, candidates: list[str]):
+    """
+    Returns the first column name found in df from the candidates list.
+    """
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
 
 
-def normalize_paychex_folder(folder_path: str) -> pd.DataFrame:
-    all_dfs = []
-    folder = Path(folder_path)
+def _parse_date_safe(series):
+    return pd.to_datetime(series, errors="coerce")
 
-    for file in folder.glob('*.xlsx'):
-        df = pd.read_excel(file)
+def _normalize_name(series: pd.Series) -> pd.Series:
+    return (
+        series.astype(str)
+        .str.upper()
+        .str.strip()
+        .str.replace(r"\s+", " ", regex=True)
+    )
 
-        df[['last_name', 'first_name']] = (
-            df['Employee Name']
-            .astype(str)
-            .str.split(',', expand=True)
+def read_paychex_files(folder: Path) -> pd.DataFrame:
+    rows = []
+
+    for file in folder.glob("*.xlsx"):
+        try:
+            df = pd.read_excel(file, engine="openpyxl")
+        except PermissionError:
+            print(f"[SKIPPED] File is open or locked: {file.name}")
+            continue
+
+        df.columns = df.columns.str.strip()
+
+        name_col = _safe_col(df, ["Name"])
+        date_col = _safe_col(df, ["Date"])
+        start_col = _safe_col(df, ["Work Start"])
+        end_col = _safe_col(df, ["Work End"])
+
+        if not name_col or not date_col:
+            print(f"[WARN] Missing required columns in {file.name}")
+            continue
+
+        names = df[name_col].astype(str).str.split(",", expand=True)
+        last = names[0].str.strip()
+        first = names[1].str.strip() if names.shape[1] > 1 else ""
+
+        temp = pd.DataFrame({
+            "first_name": _normalize_name(first),
+            "last_name": _normalize_name(last),
+            "date": _parse_date_safe(df[date_col]).dt.date,
+            "paychex_start": _parse_date_safe(df[start_col]) if start_col else pd.NaT,
+            "paychex_end": _parse_date_safe(df[end_col]) if end_col else pd.NaT,
+        })
+
+        rows.append(temp)
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "first_name", "last_name", "date",
+            "paychex_start", "paychex_end"
+        ])
+
+    return pd.concat(rows, ignore_index=True)
+
+
+def read_samsara_files(folder: Path) -> pd.DataFrame:
+    dfs = []
+
+    for file in folder.glob("*.xlsx"):
+        df = pd.read_excel(file, engine="openpyxl")
+        df.columns = df.columns.str.strip()
+
+        name_col = df.get("Driver Name")
+        date_col = df.get("Start Date")
+        start_col = df.get("Start Time")
+        end_col = df.get("End Time")
+
+        if name_col is None or date_col is None:
+            print(f"[WARN] Missing required columns in {file.name}")
+            continue
+
+        temp = pd.DataFrame({
+            "date": pd.to_datetime(date_col, errors="coerce").dt.date,
+            "start_time": start_col,
+            "end_time": end_col
+        })
+
+        split = name_col.astype(str).str.strip().str.split(" ", n=1, expand=True)
+        temp["first_name"] = _normalize_name(split[0])
+        temp["last_name"] = _normalize_name(split[1]) if split.shape[1] > 1 else ""
+
+        # Combine date + time into full datetimes
+        temp["start_samsara"] = pd.to_datetime(
+            temp["date"].astype(str) + " " + temp["start_time"].astype(str),
+            errors="coerce"
         )
 
-        df['first_name'] = df['first_name'].str.strip().str.lower()
-        df['last_name'] = df['last_name'].str.strip().str.lower()
-
-        # Robust date
-        df['date'] = pd.to_datetime(df['Date'], errors='coerce')
-        df['date'] = df['date'].fillna(pd.to_datetime(df['Work Start'], errors='coerce'))
-        df['date'] = df['date'].dt.normalize()
-
-        df['start_paychex'] = pd.to_datetime(df['Work Start'], errors='coerce')
-        df['end_paychex'] = pd.to_datetime(df['Work End'], errors='coerce')
-
-        all_dfs.append(
-            df[['first_name', 'last_name', 'date', 'start_paychex', 'end_paychex']]
+        temp["end_samsara"] = pd.to_datetime(
+            temp["date"].astype(str) + " " + temp["end_time"].astype(str),
+            errors="coerce"
         )
 
-    df = pd.concat(all_dfs, ignore_index=True)
+        # Drop raw time columns
+        temp = temp.drop(columns=["start_time", "end_time"])
 
-    # Merge duplicates
-    df = df.groupby(['first_name', 'last_name', 'date'], as_index=False).agg({
-        'start_paychex': 'min',
-        'end_paychex': 'max'
-    })
+        dfs.append(temp)
 
-    return df
+        print(f"[INFO] Loaded Samsara file: {file.name} ({len(temp)} rows)")
+
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 
-def normalize_samsara_folder(folder_path: str) -> pd.DataFrame:
-    all_dfs = []
-    folder = Path(folder_path)
-
-    def extract_first_last(parts):
-        if not parts:
-            return pd.Series([None, None])
-        if parts[-1] in NAME_SUFFIXES:
-            parts = parts[:-1]
-        if len(parts) == 1:
-            return pd.Series([parts[0], None])
-        return pd.Series([parts[0], parts[-1]])
-
-    for file in folder.glob('*.xlsx'):
-        xls = pd.ExcelFile(file)
-        for sheet in xls.sheet_names:
-            df = pd.read_excel(xls, sheet_name=sheet)
-
-            name_parts = (
-                df['Driver Name']
-                .astype(str)
-                .str.lower()
-                .str.replace(r'[^\w\s]', '', regex=True)
-                .str.split()
-            )
-            df[['first_name', 'last_name']] = name_parts.apply(extract_first_last)
-
-            df['first_name'] = df['first_name'].str.strip()
-            df['last_name'] = df['last_name'].str.strip()
-
-            # Robust date
-            df['date'] = pd.to_datetime(df['Start Date'], errors='coerce')
-            df['date'] = df['date'].fillna(pd.to_datetime(df['End Date'], errors='coerce'))
-            df['date'] = df['date'].dt.normalize()
-
-            df['start_samsara'] = pd.to_datetime(
-                df['Start Date'].astype(str) + ' ' + df['Start Time'].astype(str),
-                errors='coerce'
-            )
-            df['end_samsara'] = pd.to_datetime(
-                df['End Date'].astype(str) + ' ' + df['End Time'].astype(str),
-                errors='coerce'
-            )
-
-            all_dfs.append(
-                df[['first_name', 'last_name', 'date', 'start_samsara', 'end_samsara']]
-            )
-
-    df = pd.concat(all_dfs, ignore_index=True)
-
-    # Merge duplicates
-    df = df.groupby(['first_name', 'last_name', 'date'], as_index=False).agg({
-        'start_samsara': 'min',
-        'end_samsara': 'max'
-    })
-
-    return df
+def merge_paychex_samsara(paychex, samsara):
+    return pd.merge(
+        paychex,
+        samsara,
+        on=["first_name", "last_name", "date"],
+        how="outer"
+    )
